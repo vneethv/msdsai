@@ -1,0 +1,183 @@
+# Enhanced consumption_recommendation.py with Logging, Schema Validation,
+# Missing-Column Guards, and Top-N Recommendations
+
+import sys
+import os
+import logging
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, sum as _sum, when, lit, expr
+from pyspark.sql.functions import date_format, current_timestamp
+
+# -------------------------
+# Logging Setup
+# -------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("recommendation_logger")
+
+# -------------------------
+# Spark Session
+# -------------------------
+def get_spark_session(app_name: str) -> SparkSession:
+    return (
+        SparkSession.builder
+        .appName(app_name)
+        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+        .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
+        .getOrCreate()
+    )
+
+# -------------------------
+# Schema Validation Helper
+# -------------------------
+def validate_columns(df, required_cols, df_name):
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        logger.error(f"Missing columns in {df_name}: {missing}")
+        raise Exception(f"Schema validation failed for {df_name}. Missing columns: {missing}")
+    logger.info(f"Schema validation passed for {df_name}")
+
+# -------------------------
+# Top-N Helper
+# -------------------------
+def top_n_items(df, key_col, metric_col, n=10):
+    return (
+        df.orderBy(col(metric_col).desc())
+          .limit(n)
+    )
+
+# -------------------------
+# Main Job
+# -------------------------
+def main(config_path):
+    spark = get_spark_session("recommendation_system")
+
+    # -------------------------
+    # Load YAML
+    # -------------------------
+    import yaml
+    with open(config_path, 'r') as f:
+        cfg = yaml.safe_load(f)
+
+    seller_path = cfg['recommendation']['seller_catalog_hudi']
+    seller_path = os.path.abspath(seller_path)  # Convert relative -> absolute
+
+    company_path = cfg['recommendation']['company_sales_hudi']
+    competitor_path = cfg['recommendation']['competitor_sales_hudi']
+    output_csv = cfg['recommendation']['output_csv']
+
+    logger.info("Loading Hudi tables…")
+
+    seller = spark.read.format("hudi").load(seller_path)
+    company = spark.read.format("hudi").load(company_path)
+    competitor = spark.read.format("hudi").load(competitor_path)
+
+    # -------------------------
+    # Schema Validation
+    # -------------------------
+    validate_columns(
+        seller,
+        ["seller_id", "item_id", "item_name", "category", "marketplace_price", "stock_qty"],
+        "seller_catalog"
+    )
+
+    validate_columns(
+        company,
+        ["item_id", "units_sold", "revenue", "sale_date"],
+        "company_sales"
+    )
+
+    validate_columns(
+        competitor,
+        ["item_id", "units_sold", "revenue", "marketplace_price", "seller_id", "sale_date"],
+        "competitor_sales"
+    )
+
+    # -------------------------
+    # Clean & Preprocess
+    # -------------------------
+    company = company.withColumn("sale_ym", date_format(col("sale_date"), "yyyy-MM"))
+    competitor = competitor.withColumn("sale_ym", date_format(col("sale_date"), "yyyy-MM"))
+
+    # -------------------------
+    # Aggregate company top sellers
+    # -------------------------
+    company_agg = (
+        company.groupBy("item_id")
+            .agg(_sum("units_sold").alias("total_units"))
+    )
+
+    top_company_items = top_n_items(company_agg, "item_id", "total_units", 10)
+
+    logger.info("Computed Top-N company items")
+
+    # -------------------------
+    # Aggregate competitor top sellers
+    # -------------------------
+    competitor_agg = (
+        competitor.groupBy("item_id")
+                  .agg(_sum("units_sold").alias("comp_units"))
+    )
+
+    top_competitor_items = top_n_items(competitor_agg, "item_id", "comp_units", 10)
+
+    logger.info("Computed Top-N competitor items")
+
+    # -------------------------
+    # Join seller catalog to find missing items
+    # -------------------------
+    seller_items = seller.select("seller_id", "item_id").dropDuplicates()
+
+    missing_company = (
+        seller_items.join(top_company_items, "item_id", "right")
+                     .where(seller_items["item_id"].isNull())
+                     .select(lit(None).alias("seller_id"), "item_id", "total_units")
+    )
+
+    missing_competitor = (
+        seller_items.join(top_competitor_items, "item_id", "right")
+                     .where(seller_items["item_id"].isNull())
+                     .select(lit(None).alias("seller_id"), "item_id", "comp_units")
+    )
+
+    # -------------------------
+    # Expected revenue calculation
+    # -------------------------
+    avg_price = competitor.groupBy("item_id") \
+                       .agg(expr("avg(marketplace_price)").alias("market_price"))
+
+    expected = (
+        top_company_items.join(avg_price, "item_id", "left")
+            .withColumn(
+                "expected_units_sold",
+                col("total_units")  # naive method — can be improved
+            )
+            .withColumn(
+                "expected_revenue",
+                col("expected_units_sold") * col("market_price")
+            )
+    )
+
+    logger.info("Expected revenue calculated")
+
+    # -------------------------
+    # Final Output
+    # -------------------------
+    final = expected.select(
+        "item_id",
+        "market_price",
+        "expected_units_sold",
+        "expected_revenue"
+    )
+
+    logger.info(f"Writing recommendations output to {output_csv}")
+
+    final.write.mode("overwrite").option("header", True).csv(output_csv)
+
+    logger.info("Recommendation job completed successfully.")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1])

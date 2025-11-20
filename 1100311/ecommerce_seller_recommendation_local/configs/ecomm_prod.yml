@@ -1,0 +1,17 @@
+seller_catalog:
+  input_path: "../raw/seller_catalog_clean.csv"
+  hudi_output_path: "../processed/seller_catalog_hudi"
+
+company_sales:
+  input_path: "../raw/company_sales_clean.csv"
+  hudi_output_path: "../processed/company_sales_hudi"
+
+competitor_sales:
+  input_path: "../raw/competitor_sales_clean.csv"
+  hudi_output_path: "../processed/competitor_sales_hudi"
+
+recommendation:
+  seller_catalog_hudi: "../processed/seller_catalog_hudi"
+  company_sales_hudi: "../processed/company_sales_hudi"
+  competitor_sales_hudi: "../processed/competitor_sales_hudi"
+  output_csv: "../processed/recommendations_csv/seller_recommend_data.csv"
