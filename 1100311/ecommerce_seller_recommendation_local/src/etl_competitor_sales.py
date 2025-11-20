@@ -12,17 +12,27 @@ def get_spark_session(app_name: str):
 def main(config_path):
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
-    inp = cfg['competitor_sales']['input_path']
-    out = cfg['competitor_sales']['hudi_output_path']
+
+    inp         = cfg['competitor_sales']['input_path']
+    out         = cfg['competitor_sales']['hudi_output_path']
+    bronze_out  = out + "/bronze/"
+    silver_out  = out + "/silver/"
+    gold_out    = out + "/gold/"
 
     spark = get_spark_session("etl_competitor_sales")
-    df = (spark.read.option("header",True).csv(inp))
+    bronze = (spark.read.option("header",True).csv(inp))
+    # write bronze for reference
+    bronze.write.mode("overwrite").csv(bronze_out)
 
+    silver = bronze
     for c in ['item_id','seller_id']:
-        df = df.withColumn(c, F.trim(F.col(c)))
-    df = df.withColumn('units_sold', F.col('units_sold').cast('int'))           .withColumn('revenue', F.col('revenue').cast('double'))           .withColumn('marketplace_price', F.col('marketplace_price').cast('double'))           .withColumn('sale_date', F.to_date(F.col('sale_date')))
+        silver = silver.withColumn(c, F.trim(F.col(c)))
+    silver = silver.withColumn('units_sold', F.col('units_sold').cast('int'))           .withColumn('revenue', F.col('revenue').cast('double'))           .withColumn('marketplace_price', F.col('marketplace_price').cast('double'))           .withColumn('sale_date', F.to_date(F.col('sale_date')))
 
-    df = df.fillna({'units_sold':0, 'revenue':0.0, 'marketplace_price':0.0})
+    silver = silver.fillna({'units_sold':0, 'revenue':0.0, 'marketplace_price':0.0})
+
+    # write silver for reference
+    silver.write.mode('overwrite').option('header',True).parquet(silver_out)
 
     dq_exprs = [
       ("missing_item_id", F.col('item_id').isNull()),
@@ -35,18 +45,19 @@ def main(config_path):
 
     bad = None
     for name, expr in dq_exprs:
-        bad_part = df.filter(expr).withColumn("dq_failure_reason", F.lit(name))
+        bad_part = silver.filter(expr).withColumn("dq_failure_reason", F.lit(name))
         bad = bad_part if bad is None else bad.unionByName(bad_part, allowMissingColumns=True)
 
-    good = df
+    gold = silver
     if bad is not None:
         bad.write.mode('overwrite').option('header',True).csv(out + "/quarantine/")
         bad_keys = bad.select('item_id','seller_id').distinct()
-        good = good.join(bad_keys, on=['item_id','seller_id'], how='left_anti')
+        gold = gold.join(bad_keys, on=['item_id','seller_id'], how='left_anti')
 
-    good = good.dropDuplicates(['seller_id','item_id'])
+    gold = gold.dropDuplicates(['seller_id','item_id'])
 
-    good.write.mode('overwrite').option('header',True).parquet(out + "/cleaned_parquet/")
+    # write silver for reference
+    gold.write.mode('overwrite').option('header',True).parquet(gold_out)
     spark.stop()
 
 if __name__ == '__main__':

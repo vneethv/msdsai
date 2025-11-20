@@ -12,24 +12,29 @@ def get_spark_session(app_name: str):
 def main(config_path):
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
-    inp = cfg['seller_catalog']['input_path']
-    out = cfg['seller_catalog']['hudi_output_path']
+
+    inp          = cfg['seller_catalog']['input_path']
+    out          = cfg['seller_catalog']['hudi_output_path']
+    bronze_out   = out + "/bronze/"
+    silver_out   = out + "/silver/"
+    gold_out     = out + "/gold/"
 
     spark = get_spark_session("etl_seller_catalog")
-    df = (spark.read.option("header",True).csv(inp))
+    bronze = (spark.read.option("header",True).csv(inp))
+    bronze.write.mode("overwrite").csv(bronze_out)
 
     # Trim and rename
     for c in ['seller_id','item_id','item_name','category']:
-        df = df.withColumn(c, F.trim(F.col(c)))
+        silver = bronze.withColumn(c, F.trim(F.col(c)))
     # Normalize casing
-    df = df.withColumn('item_name', F.initcap(F.col('item_name')))
-    df = df.withColumn('category', F.initcap(F.col('category')))
+    silver = silver.withColumn('item_name', F.initcap(F.col('item_name')))
+    silver = silver.withColumn('category', F.initcap(F.col('category')))
 
     # Cast numeric
-    df = df.withColumn('marketplace_price', F.col('marketplace_price').cast('double'))           .withColumn('stock_qty', F.col('stock_qty').cast('int'))
+    silver = silver.withColumn('marketplace_price', F.col('marketplace_price').cast('double'))           .withColumn('stock_qty', F.col('stock_qty').cast('int'))
 
     # Fill stock nulls with 0
-    df = df.withColumn('stock_qty', F.when(F.col('stock_qty').isNull(), F.lit(0)).otherwise(F.col('stock_qty')))
+    silver = silver.withColumn('stock_qty', F.when(F.col('stock_qty').isNull(), F.lit(0)).otherwise(F.col('stock_qty')))
 
     # DQ checks: collect bad records
     dq_exprs = [
@@ -43,22 +48,24 @@ def main(config_path):
 
     bad = None
     for name, expr in dq_exprs:
-        bad_part = df.filter(expr).withColumn("dq_failure_reason", F.lit(name))
+        bad_part = silver.filter(expr).withColumn("dq_failure_reason", F.lit(name))
         bad = bad_part if bad is None else bad.unionByName(bad_part, allowMissingColumns=True)
 
-    good = df
+    silver.write.mode('overwrite').option('header',True).parquet(silver_out)
+
+    gold = silver
     if bad is not None:
-        # remove bad records from good by anti-join on primary key
+        # remove bad records from gold by anti-join on primary key
         key = ['seller_id','item_id']
         bad_keys = bad.select(*key).distinct()
-        good = good.join(bad_keys, on=key, how='left_anti')
+        gold = gold.join(bad_keys, on=key, how='left_anti')
         # write bad to quarantine (CSV)
         bad.write.mode('overwrite').option('header',True).csv(out + "/quarantine/")
     # Remove duplicates based on key keeping latest (if no timestamp, keep first)
-    good = good.dropDuplicates(['seller_id','item_id'])
+    gold = gold.dropDuplicates(['seller_id','item_id'])
 
     # Write cleaned parquet (placeholder for Hudi - here using parquet for local)
-    good.write.mode('overwrite').option('header',True).parquet(out + "/cleaned_parquet/")
+    gold.write.mode('overwrite').option('header',True).parquet(gold_out)
     spark.stop()
 
 if __name__ == '__main__':
